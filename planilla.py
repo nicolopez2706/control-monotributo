@@ -137,7 +137,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         avisos.append("⚠ Facturas de CUIT que no están en trabajadores.csv: "
                       + ", ".join(str(c) for c in sorted(sin_registrar)))
     if n_errores:
-        avisos.append(f"⚠ {n_errores} PDF no se pudieron leer (carpeta con_error): cargalos a mano en facturas.csv")
+        avisos.append(f"⚠ {n_errores} PDF no se pudieron leer en la última ejecución (quedaron en con_error): cargalos a mano")
     for i, t in enumerate(avisos):
         c = res.cell(row=9 + i, column=1, value=t)
         c.font = fnt(10, True, "9C0006")
