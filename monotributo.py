@@ -1,15 +1,19 @@
 """
-Control de monotributo - lee las facturas PDF (QR de ARCA), actualiza los datos,
-genera el Excel y el RESUMEN.md, y avisa por mail si alguien pasa a ALERTA/EXCEDIDO.
+Control de monotributo - lee las facturas PDF (QR de ARCA) desde Google Drive (o desde la carpeta
+"facturas" del repositorio), actualiza los datos, genera el Excel y el RESUMEN.md, y avisa por mail
+si alguien pasa a ALERTA/EXCEDIDO.
 """
 import base64
 import configparser
+import io
 import json
 import os
 import re
 import shutil
 import smtplib
 import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -27,6 +31,7 @@ DATOS = BASE / "datos"
 ENTRADA, PROCESADAS, ERRORES = BASE / "facturas", BASE / "procesadas", BASE / "con_error"
 F_TRAB, F_TOPES, F_FAC = DATOS / "trabajadores.csv", DATOS / "topes.csv", DATOS / "facturas.csv"
 ESTADO = DATOS / "estado.json"
+F_DRIVE = DATOS / "drive_procesados.json"
 EXCEL = BASE / "Control_Monotributo_SERVELEC.xlsx"
 RESUMEN_MD = BASE / "RESUMEN.md"
 LOG = BASE / "registro.log"
@@ -162,7 +167,7 @@ def extraer_url_qr(pdf):
     raise ValueError("no se encontró ningún código QR en el PDF")
 
 
-def leer_comprobante(pdf):
+def leer_comprobante(pdf, nombre=None):
     url = extraer_url_qr(pdf)
     p = parse_qs(urlparse(url).query).get("p")
     if not p:
@@ -179,7 +184,7 @@ def leer_comprobante(pdf):
         "fecha": date.fromisoformat(d["fecha"]), "cuit": int(d["cuit"]),
         "comprobante": TIPOS.get(tipo, f"Tipo {tipo}"), "pto_vta": int(d["ptoVta"]),
         "numero": int(d["nroCmp"]), "importe": round(importe, 2),
-        "moneda": str(d.get("moneda", "PES")), "archivo": pdf.name, "cargado": hoy_argentina(),
+        "moneda": str(d.get("moneda", "PES")), "archivo": nombre or pdf.name, "cargado": hoy_argentina(),
     }
 
 
@@ -233,7 +238,7 @@ def escribir_resumen_md(cfg, hoy, inicio, estados, sin_registrar, n_errores):
         L += ["", "⚠️ CUIT con facturas que no están en `datos/trabajadores.csv`: "
               + ", ".join(cuit_fmt(c) for c in sorted(sin_registrar))]
     if n_errores:
-        L += ["", f"⚠️ {n_errores} PDF no se pudieron leer (carpeta `con_error`)."]
+        L += ["", f"⚠️ {n_errores} PDF no se pudieron leer en la última ejecución (quedaron en `con_error`)."]
     L += ["", "_Detalle y gráficos en `Control_Monotributo_SERVELEC.xlsx`._"]
     RESUMEN_MD.write_text("\n".join(L) + "\n", encoding="utf-8")
 
@@ -282,6 +287,14 @@ def enviar_avisos(cfg, estados):
     ESTADO.write_text(json.dumps({str(x["cuit"]): x["estado"] for x in estados}), encoding="utf-8")
 
 
+# ------------------------------------------------------------------ de dónde salen los PDF
+@dataclass
+class Item:
+    id: str
+    nombre: str
+    ruta: Path
+
+
 def mover(archivo, carpeta):
     destino = carpeta / archivo.name
     if destino.exists():
@@ -289,52 +302,151 @@ def mover(archivo, carpeta):
     shutil.move(str(archivo), str(destino))
 
 
+class OrigenLocal:
+    """PDF subidos a la carpeta 'facturas' del repositorio (alternativa a Drive)."""
+    nombre = "carpeta facturas del repositorio"
+
+    def pendientes(self):
+        ENTRADA.mkdir(exist_ok=True)
+        return [Item(str(p), p.name, p) for p in sorted(ENTRADA.iterdir()) if p.suffix.lower() == ".pdf"]
+
+    def terminar(self, item, resultado):
+        destino = ERRORES if resultado == "error" else PROCESADAS
+        destino.mkdir(exist_ok=True)
+        mover(item.ruta, destino)
+
+
+class OrigenDrive:
+    """PDF guardados en una carpeta de Google Drive compartida con la cuenta de servicio."""
+    nombre = "Google Drive"
+
+    def __init__(self, servicio, carpeta_id, tmp):
+        self.s, self.carpeta, self.tmp = servicio, carpeta_id, Path(tmp)
+        self.hechos = json.loads(F_DRIVE.read_text(encoding="utf-8")) if F_DRIVE.exists() else {}
+        self.sub = {n: self._buscar_subcarpeta(n) for n in ("procesadas", "con_error")}
+
+    @classmethod
+    def desde_entorno(cls, tmp):
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"])
+        servicio = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return cls(servicio, os.environ["DRIVE_FOLDER_ID"].strip(), tmp)
+
+    def _listar(self, q):
+        out, token = [], None
+        while True:
+            r = self.s.files().list(q=q, fields="nextPageToken, files(id, name)", pageSize=100,
+                                    pageToken=token, supportsAllDrives=True,
+                                    includeItemsFromAllDrives=True).execute()
+            out += r.get("files", [])
+            token = r.get("nextPageToken")
+            if not token:
+                return out
+
+    def _buscar_subcarpeta(self, nombre):
+        q = (f"'{self.carpeta}' in parents and trashed=false and name='{nombre}' "
+             "and mimeType='application/vnd.google-apps.folder'")
+        r = self._listar(q)
+        return r[0]["id"] if r else None
+
+    def _descargar(self, file_id):
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, self.s.files().get_media(fileId=file_id, supportsAllDrives=True))
+        listo = False
+        while not listo:
+            _, listo = dl.next_chunk()
+        return buf.getvalue()
+
+    def _mover(self, file_id, destino):
+        self.s.files().update(fileId=file_id, addParents=destino, removeParents=self.carpeta,
+                              supportsAllDrives=True, fields="id").execute()
+
+    def pendientes(self):
+        q = f"'{self.carpeta}' in parents and trashed=false and mimeType='application/pdf'"
+        items = []
+        for f in self._listar(q):
+            if f["id"] in self.hechos:
+                continue
+            ruta = self.tmp / f"{f['id']}.pdf"
+            ruta.write_bytes(self._descargar(f["id"]))
+            items.append(Item(f["id"], f["name"], ruta))
+        return items
+
+    def terminar(self, item, resultado):
+        # Se anota siempre qué PDF ya se vio (así no se relee aunque no se pueda mover en Drive)
+        self.hechos[item.id] = {"nombre": item.nombre, "resultado": resultado,
+                                "fecha": hoy_argentina().isoformat()}
+        F_DRIVE.write_text(json.dumps(self.hechos, indent=1, ensure_ascii=False), encoding="utf-8")
+        destino = self.sub["con_error" if resultado == "error" else "procesadas"]
+        if destino:
+            try:
+                self._mover(item.id, destino)
+            except Exception as e:
+                log(f"[AVISO] No pude mover '{item.nombre}' dentro de Drive: {e}")
+
+
 # ------------------------------------------------------------------ principal
 def main():
-    for d in (DATOS, ENTRADA, PROCESADAS, ERRORES):
-        d.mkdir(exist_ok=True)
+    DATOS.mkdir(exist_ok=True)
     cfg, hoy = leer_config(), hoy_argentina()
     trab, topes, fac = cargar_trabajadores(), cargar_topes(), cargar_facturas()
     if not topes:
         sys.exit("Falta datos/topes.csv (o está vacío).")
 
-    pdfs = sorted(p for p in ENTRADA.iterdir() if p.suffix.lower() == ".pdf")
-    leidos, fallidos = [], []
-    for pdf in pdfs:
+    tmp = tempfile.TemporaryDirectory()
+    origenes, hubo_fallo = [OrigenLocal()], False
+    if os.environ.get("GOOGLE_CREDENTIALS") and os.environ.get("DRIVE_FOLDER_ID"):
         try:
-            leidos.append((pdf, leer_comprobante(pdf)))
+            origenes.append(OrigenDrive.desde_entorno(tmp.name))
         except Exception as e:
-            log(f"[ERROR] {pdf.name}: {e}")
-            fallidos.append(pdf)
+            log(f"[ERROR] No pude conectarme a Google Drive: {e}")
+            hubo_fallo = True
+    pendientes = []
+    for o in origenes:
+        try:
+            pendientes += [(o, it) for it in o.pendientes()]
+        except Exception as e:
+            log(f"[ERROR] No pude leer los PDF de {o.nombre}: {e}")
+            hubo_fallo = True
 
     claves = set(fac["clave"])
-    agregadas, duplicadas = [], 0
-    for _, c in leidos:
+    agregadas, resultados = [], []
+    for o, it in pendientes:
+        try:
+            c = leer_comprobante(it.ruta, it.nombre)
+        except Exception as e:
+            log(f"[ERROR] {it.nombre}: {e}")
+            resultados.append((o, it, "error"))
+            continue
         if c["clave"] in claves:
-            duplicadas += 1
+            resultados.append((o, it, "duplicado"))
         else:
             claves.add(c["clave"])
             agregadas.append(c)
+            resultados.append((o, it, "ok"))
     if agregadas:
         fac = pd.concat([fac, pd.DataFrame(agregadas)[COLUMNAS_FAC]], ignore_index=True)
         fac.sort_values(["fecha", "cuit", "numero"]).to_csv(F_FAC, index=False, encoding="utf-8")
-    for pdf, _ in leidos:
-        mover(pdf, PROCESADAS)
-    for pdf in fallidos:
-        mover(pdf, ERRORES)
-    if pdfs:
-        log(f"PDF encontrados: {len(pdfs)} | cargados: {len(agregadas)} | "
-            f"duplicados: {duplicadas} | con error: {len(fallidos)}")
+    for o, it, r in resultados:
+        o.terminar(it, r)
+    if pendientes:
+        cuenta = lambda r: sum(1 for x in resultados if x[2] == r)
+        log(f"PDF encontrados: {len(pendientes)} | cargados: {cuenta('ok')} | "
+            f"duplicados: {cuenta('duplicado')} | con error: {cuenta('error')}")
         for c in agregadas:
             log(f"  + {cuit_fmt(c['cuit'])}  {c['comprobante']} {c['pto_vta']:05d}-{c['numero']:08d}  "
                 f"{pesos(c['importe'])}")
     else:
-        print("No hay PDF nuevos en la carpeta facturas.")
+        print("No hay PDF nuevos.")
+    errores_pend = sum(1 for x in resultados if x[2] == "error")
 
     estados, matriz, inicio, meses = calcular(trab, topes, fac, cfg["umbral"], hoy)
     nombres = {t["cuit"]: t["nombre"] for t in trab}
     sin_registrar = set(fac["cuit"]) - set(nombres)
-    errores_pend = len([p for p in ERRORES.iterdir() if p.suffix.lower() == ".pdf"])
     registro = []
     for _, f in fac.sort_values(["fecha", "numero"], ascending=False).iterrows():
         registro.append({"fecha": f["fecha"], "cuit": int(f["cuit"]),
@@ -352,6 +464,8 @@ def main():
         print(f"[AVISO] El CUIT {cuit_fmt(cuit)} tiene facturas pero no está en trabajadores.csv")
     mostrar(estados)
     enviar_avisos(cfg, estados)
+    if hubo_fallo:
+        sys.exit("Hubo errores al leer los PDF (ver arriba): el control se generó con los datos disponibles.")
 
 
 if __name__ == "__main__":
