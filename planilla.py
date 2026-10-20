@@ -337,7 +337,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
                 c.fill = fill(GREY)
         if f["trabajador"] == "No registrado":
             fac.cell(row=r, column=3).fill = fill("FFC7CE")
-            fac.cell(row=r, column=3).font = fnt(10, True, "9C0006")
+            f.cell(row=r, column=3).font = fnt(10, True, "9C0006")
     fac.auto_filter.ref = f"A4:K{4 + max(len(facturas), 1)}"
     fac.freeze_panes = "A5"
     anchos(fac, [12, 16, 28, 26, 9, 12, 18, 11, 26, 12, 22])
@@ -350,7 +350,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         a.font, a.alignment, a.border = fnt(10, True), Alignment(horizontal="center"), box
         b = top.cell(row=5 + i, column=2, value=v)
         b.number_format, b.font, b.border = MONEY, fnt(10), box
-    top        ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
+    ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
                      "Si falta cargar alguna, su total real puede ser mayor."),
 
     # ============================================================ INSTRUCCIONES
