@@ -141,23 +141,29 @@ def cargar_facturas():
 
 
 def cargar_historico():
-    """Totales mensuales anteriores al uso de los PDF. Columnas: cuit, mes (AAAA-MM), importe."""
+    """Facturación anterior al uso de los PDF. Columnas: cuit, fecha, importe.
+    La fecha puede ser un día exacto (2026-03-15, una factura) o un mes (2026-03, el total de ese mes)."""
     df, out = leer_csv(F_HIST), []
     for _, r in df.iterrows():
         cuit = re.sub(r"\D", "", r.get("cuit", ""))
-        if not cuit or not r.get("mes", "").strip() or not r.get("importe", "").strip():
+        valor = (r.get("fecha") or r.get("mes") or "").strip()
+        if not cuit or not valor or not r.get("importe", "").strip():
             continue
         try:
-            p = pd.Period(r["mes"].strip(), "M")
+            if len(valor) <= 7:
+                fecha, tipo = pd.Period(valor, "M").end_time.date(), "Histórico (total del mes)"
+            else:
+                fecha, tipo = date.fromisoformat(valor), "Histórico (factura)"
             importe = numero(r["importe"])
         except ValueError:
-            print(f"[AVISO] historico.csv: fila ignorada (revisar mes o importe): {dict(r)}")
+            print(f"[AVISO] historico.csv: fila ignorada (revisar fecha o importe): {dict(r)}")
             continue
-        out.append({"clave": f"HIST-{cuit}-{p}", "fecha": p.end_time.date(), "cuit": int(cuit),
-                    "comprobante": "Histórico (total del mes)", "pto_vta": 0, "numero": 0,
+        out.append({"clave": f"HIST-{cuit}-{fecha}", "fecha": fecha, "cuit": int(cuit),
+                    "comprobante": tipo, "pto_vta": 0, "numero": 0,
                     "importe": importe, "moneda": "PES", "archivo": "historico.csv",
                     "cargado": hoy_argentina()})
     return pd.DataFrame(out, columns=COLUMNAS_FAC)
+
 
 
 # ------------------------------------------------------------------ lectura del QR
