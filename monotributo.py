@@ -32,6 +32,7 @@ ENTRADA, PROCESADAS, ERRORES = BASE / "facturas", BASE / "procesadas", BASE / "c
 F_TRAB, F_TOPES, F_FAC = DATOS / "trabajadores.csv", DATOS / "topes.csv", DATOS / "facturas.csv"
 ESTADO = DATOS / "estado.json"
 F_DRIVE = DATOS / "drive_procesados.json"
+F_HIST = DATOS / "historico.csv"
 EXCEL = BASE / "Control_Monotributo_SERVELEC.xlsx"
 RESUMEN_MD = BASE / "RESUMEN.md"
 LOG = BASE / "registro.log"
@@ -137,6 +138,26 @@ def cargar_facturas():
     df["numero"] = df["numero"].astype("int64")
     df["importe"] = df["importe"].astype(float)
     return df[COLUMNAS_FAC]
+
+
+def cargar_historico():
+    """Totales mensuales anteriores al uso de los PDF. Columnas: cuit, mes (AAAA-MM), importe."""
+    df, out = leer_csv(F_HIST), []
+    for _, r in df.iterrows():
+        cuit = re.sub(r"\D", "", r.get("cuit", ""))
+        if not cuit or not r.get("mes", "").strip() or not r.get("importe", "").strip():
+            continue
+        try:
+            p = pd.Period(r["mes"].strip(), "M")
+            importe = numero(r["importe"])
+        except ValueError:
+            print(f"[AVISO] historico.csv: fila ignorada (revisar mes o importe): {dict(r)}")
+            continue
+        out.append({"clave": f"HIST-{cuit}-{p}", "fecha": p.end_time.date(), "cuit": int(cuit),
+                    "comprobante": "Histórico (total del mes)", "pto_vta": 0, "numero": 0,
+                    "importe": importe, "moneda": "PES", "archivo": "historico.csv",
+                    "cargado": hoy_argentina()})
+    return pd.DataFrame(out, columns=COLUMNAS_FAC)
 
 
 # ------------------------------------------------------------------ lectura del QR
@@ -394,6 +415,8 @@ def main():
     DATOS.mkdir(exist_ok=True)
     cfg, hoy = leer_config(), hoy_argentina()
     trab, topes, fac = cargar_trabajadores(), cargar_topes(), cargar_facturas()
+    hist = cargar_historico()
+    hasta = hist.groupby("cuit")["fecha"].max().to_dict() if not hist.empty else {}
     if not topes:
         sys.exit("Falta datos/topes.csv (o está vacío).")
 
@@ -422,7 +445,10 @@ def main():
             log(f"[ERROR] {it.nombre}: {e}")
             resultados.append((o, it, "error"))
             continue
-        if c["clave"] in claves:
+        if c["fecha"] <= hasta.get(c["cuit"], date.min):
+            log(f"[AVISO] {it.nombre}: es del {c['fecha']:%d/%m/%Y}, un mes que ya está en el histórico: no se suma.")
+            resultados.append((o, it, "duplicado"))
+        elif c["clave"] in claves:
             resultados.append((o, it, "duplicado"))
         else:
             claves.add(c["clave"])
@@ -444,6 +470,7 @@ def main():
         print("No hay PDF nuevos.")
     errores_pend = sum(1 for x in resultados if x[2] == "error")
 
+    fac = pd.concat([fac, hist], ignore_index=True) if not hist.empty else fac
     estados, matriz, inicio, meses = calcular(trab, topes, fac, cfg["umbral"], hoy)
     nombres = {t["cuit"]: t["nombre"] for t in trab}
     sin_registrar = set(fac["cuit"]) - set(nombres)
@@ -451,7 +478,7 @@ def main():
     for _, f in fac.sort_values(["fecha", "numero"], ascending=False).iterrows():
         registro.append({"fecha": f["fecha"], "cuit": int(f["cuit"]),
                          "trabajador": nombres.get(int(f["cuit"]), "No registrado"),
-                         "tipo": f["comprobante"], "pto_vta": int(f["pto_vta"]), "numero": int(f["numero"]),
+                         "tipo": f["comprobante"], "pto_vta": int(f["pto_vta"]) or None, "numero": int(f["numero"]) or None,
                          "importe": f["importe"], "moneda": f["moneda"], "archivo": f["archivo"],
                          "cargado": f["cargado"], "computa": inicio <= f["fecha"] <= hoy})
     try:
