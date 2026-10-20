@@ -1,0 +1,45 @@
+name: Control de monotributo
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # todos los días a las 11:00 UTC = 08:00 en Argentina
+  workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
+
+permissions:
+  contents: write           # permite guardar el Excel y los datos en el repositorio
+
+concurrency:
+  group: control-monotributo
+  cancel-in-progress: false
+
+jobs:
+  ejecutar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar librerías
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar control
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          SMTP_USUARIO: ${{ secrets.SMTP_USUARIO }}
+          SMTP_CLAVE: ${{ secrets.SMTP_CLAVE }}
+          SMTP_DESTINATARIOS: ${{ secrets.SMTP_DESTINATARIOS }}
+        run: python monotributo.py
+
+      - name: Guardar resultados en el repositorio
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (git commit -m "Actualización automática $(date -u +%F)" && git pull --rebase && git push)
