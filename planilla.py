@@ -350,8 +350,8 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         a.font, a.alignment, a.border = fnt(10, True), Alignment(horizontal="center"), box
         b = top.cell(row=5 + i, column=2, value=v)
         b.number_format, b.font, b.border = MONEY, fnt(10), box
-    top.cell(row=6 + len(topes), column=1, value="Se editan en datos/topes.csv").font = fnt(9, italic=True, color="595959")
-    anchos(top, [14, 34])
+    top        ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
+                     "Si falta cargar alguna, su total real puede ser mayor."),
 
     # ============================================================ INSTRUCCIONES
     titulo(ins, "Cómo se usa esta planilla", 2)
@@ -364,8 +364,8 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         ("Mensual", "Cuánto facturó cada uno mes a mes (mapa de calor)."),
         ("Período", "Los 12 meses calendario que terminan en el mes actual (incluido). ARCA usa meses cerrados: "
                     "este criterio es algo más conservador."),
-        ("Limitación", "Solo suma lo facturado por este circuito. Si el trabajador tiene otros clientes, su total "
-                       "real puede ser mayor."),
+        ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
+                     "Si falta cargar alguna, su total real puede ser mayor."),
         ("Aviso", "Herramienta de control interno. No reemplaza el asesoramiento de un contador."),
     ]
     for i, (k, v) in enumerate(lineas):
