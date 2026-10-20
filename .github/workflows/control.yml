@@ -1,9 +1,7 @@
 name: Control de monotributo
 
 on:
-  schedule:
-    - cron: "0 11 * * *"   # todos los días a las 11:00 UTC = 08:00 en Argentina
-  workflow_dispatch:        # botón "Run workflow" para ejecutarlo a mano
+  workflow_dispatch:        # lo dispara cron-job.org (o el botón "Run workflow")
 
 permissions:
   contents: write           # permite guardar el Excel y los datos en el repositorio
