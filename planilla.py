@@ -1,352 +1,789 @@
-"""Genera el Excel de control (se regenera completo en cada ejecución)."""
-from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.worksheet.datavalidation import DataValidation
+"""
+Control de monotributo - lee las facturas PDF (QR de ARCA) desde Google Drive (o desde la carpeta
+"facturas" del repositorio), actualiza los datos, genera el Excel y el RESUMEN.md, y avisa por mail
+si alguien pasa a ALERTA/EXCEDIDO.
+"""
+import base64
+import configparser
+import io
+import json
+import os
+import re
+import shutil
+import smtplib
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import date, datetime
+from email.message import EmailMessage
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-F = "Arial"
-NAVY, MID, GREY = "1F3864", "2F5597", "F2F2F2"
-MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
-MONEY = '"$" #,##0.00;[Red]-"$" #,##0.00;"-"'
-MONEY0 = '"$" #,##0;[Red]-"$" #,##0;"-"'
-CUIT = '00"-"00000000"-"0'
-DATE = "dd/mm/yyyy"
-ESTADOS = {  # estado: (fondo, texto)
-    "OK": ("C6EFCE", "006100"), "ALERTA": ("FFEB9C", "9C5700"),
-    "EXCEDIDO": ("FFC7CE", "9C0006"), "FALTA TOPE": ("E7E6E6", "595959"),
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+import pandas as pd
+
+import planilla
+
+BASE = Path(__file__).resolve().parent
+DATOS = BASE / "datos"
+ENTRADA, PROCESADAS, ERRORES = BASE / "facturas", BASE / "procesadas", BASE / "con_error"
+F_TRAB, F_TOPES, F_FAC = DATOS / "trabajadores.csv", DATOS / "topes.csv", DATOS / "facturas.csv"
+ESTADO = DATOS / "estado.json"
+F_DRIVE = DATOS / "drive_procesados.json"
+F_HIST = DATOS / "historico.csv"
+EXCEL = BASE / "Control_Monotributo_SERVELEC.xlsx"
+RESUMEN_MD = BASE / "RESUMEN.md"
+LOG = BASE / "registro.log"
+CONFIG = BASE / "config.ini"
+
+TIPOS = {
+    1: "Factura A", 2: "Nota de Débito A", 3: "Nota de Crédito A",
+    6: "Factura B", 7: "Nota de Débito B", 8: "Nota de Crédito B",
+    11: "Factura C", 12: "Nota de Débito C", 13: "Nota de Crédito C",
+    51: "Factura M", 52: "Nota de Débito M", 53: "Nota de Crédito M",
+    201: "Factura de Crédito MiPyME A", 202: "Nota de Débito MiPyME A", 203: "Nota de Crédito MiPyME A",
+    206: "Factura de Crédito MiPyME B", 207: "Nota de Débito MiPyME B", 208: "Nota de Crédito MiPyME B",
+    211: "Factura de Crédito MiPyME C", 212: "Nota de Débito MiPyME C", 213: "Nota de Crédito MiPyME C",
 }
-thin = Side(style="thin", color="D9D9D9")
-box = Border(left=thin, right=thin, top=thin, bottom=thin)
+NOTAS_DE_CREDITO = {3, 8, 13, 53, 203, 208, 213}
+RANGO = {"OK": 0, "FALTA TOPE": 0, "ALERTA": 1, "EXCEDIDO": 2}
+COLUMNAS_FAC = ["clave", "fecha", "cuit", "comprobante", "pto_vta", "numero",
+                "importe", "moneda", "archivo", "cargado"]
 
 
-def fnt(size=10, bold=False, color="000000", italic=False):
-    return Font(name=F, size=size, bold=bold, color=color, italic=italic)
+# ------------------------------------------------------------------ utilidades
+def log(msg):
+    print(msg)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
 
 
-def fill(c):
-    return PatternFill("solid", fgColor=c)
+def pesos(v):
+    return "$ " + f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def seguro(v):
-    """Un texto que empiece con '=' se interpretaría como fórmula: se le antepone un espacio."""
-    return " " + v if isinstance(v, str) and v.startswith("=") else v
+def cuit_fmt(c):
+    s = str(int(c)).zfill(11)
+    return f"{s[:2]}-{s[2:10]}-{s[10]}"
 
 
-def etiqueta_mes(p):
-    return f"{MESES[p.month - 1]}-{str(p.year)[2:]}"
+def numero(txt):
+    """Acepta 12009410.45 / 12.009.410,45 / $ 12009410,45"""
+    s = str(txt).replace("$", "").replace(" ", "").strip()
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    return float(s)
 
 
-def titulo(ws, texto, hasta_col, sub=None):
-    ws["A1"] = texto
-    ws["A1"].font = fnt(16, True, "FFFFFF")
-    ws["A1"].alignment = Alignment(vertical="center", indent=1)
-    for c in range(1, hasta_col + 1):
-        ws.cell(row=1, column=c).fill = fill(NAVY)
-    ws.row_dimensions[1].height = 32
-    if sub:
-        ws["A2"] = sub
-        ws["A2"].font = fnt(9, italic=True, color="595959")
-        ws["A2"].alignment = Alignment(indent=1)
+def hoy_argentina():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).date()
+    except Exception:
+        return date.today()
 
 
-def encabezado(ws, fila, etiquetas, col0=1):
-    for i, e in enumerate(etiquetas):
-        c = ws.cell(row=fila, column=col0 + i, value=e)
-        c.font = fnt(10, True, "FFFFFF")
-        c.fill = fill(MID)
-        c.border = box
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[fila].height = 30
+def leer_config():
+    cp = configparser.ConfigParser()
+    cp.read(CONFIG, encoding="utf-8")
+    g = cp["general"] if cp.has_section("general") else {}
+    return {
+        "empresa": g.get("empresa", "SERVELEC"),
+        "umbral": float(g.get("umbral", "0.80")),
+        "vigencia": g.get("topes_vigencia", ""),
+        "mail": cp["email"] if cp.has_section("email") else {},
+    }
 
 
-def anchos(ws, lista):
-    for i, w in enumerate(lista, start=1):
-        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+# ------------------------------------------------------------------ datos (CSV)
+def leer_csv(ruta, sniff=True):
+    if not ruta.exists():
+        return pd.DataFrame()
+    kw = dict(sep=None, engine="python") if sniff else dict(sep=",")
+    df = pd.read_csv(ruta, dtype=str, encoding="utf-8-sig", **kw).fillna("")
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
 
 
-def estilo_grafico(ch, texto, w=17.5, h=8.5):
-    ch.title = texto
-    ch.width, ch.height = w, h
-    ch.x_axis.delete = False
-    ch.y_axis.delete = False
-    if ch.legend is not None:
-        ch.legend.position = "b"
+def cargar_trabajadores():
+    df, out = leer_csv(F_TRAB), []
+    for _, r in df.iterrows():
+        cuit = re.sub(r"\D", "", r.get("cuit", ""))
+        if cuit:
+            out.append({"cuit": int(cuit), "nombre": r.get("nombre", "").strip(),
+                        "cat": r.get("categoria", "").strip().upper()})
+    return out
 
 
-def pintar(serie, color):
-    serie.graphicalProperties.solidFill = color
-    serie.graphicalProperties.line.solidFill = color
+def cargar_topes():
+    df, out = leer_csv(F_TOPES), []
+    for _, r in df.iterrows():
+        if r.get("categoria", "").strip() and r.get("tope", "").strip():
+            out.append((r["categoria"].strip().upper(), numero(r["tope"])))
+    return out
 
 
-def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, facturas,
-              topes, vigencia_topes, sin_registrar, n_errores):
-    """
-    estados : lista de dicts (cuit, nombre, cat, tope, total, disp, uso, estado, ultima, ritmo, meses_tope)
-    matriz  : {cuit: [12 importes mensuales]}
-    facturas: lista de dicts del registro completo (fecha, cuit, trabajador, tipo, pto_vta, numero,
-              importe, moneda, archivo, cargado, computa)
-    """
-    wb = Workbook()
-    res = wb.active
-    res.title = "Resumen"
-    gra = wb.create_sheet("Gráficos")
-    fic = wb.create_sheet("Ficha")
-    men = wb.create_sheet("Mensual")
-    fac = wb.create_sheet("Facturas")
-    top = wb.create_sheet("Topes")
-    for ws in wb.worksheets:
-        ws.sheet_view.showGridLines = False
-    n = len(estados)
-    periodo = f"{etiqueta_mes(meses[0])} a {etiqueta_mes(meses[-1])}"
+def cargar_facturas():
+    df = leer_csv(F_FAC, sniff=False)
+    if df.empty:
+        return pd.DataFrame(columns=COLUMNAS_FAC)
+    df["fecha"] = pd.to_datetime(df["fecha"]).dt.date
+    df["cargado"] = pd.to_datetime(df["cargado"]).dt.date
+    df["cuit"] = df["cuit"].astype("int64")
+    df["pto_vta"] = df["pto_vta"].astype(int)
+    df["numero"] = df["numero"].astype("int64")
+    df["importe"] = df["importe"].astype(float)
+    return df[COLUMNAS_FAC]
 
-    # ============================================================ RESUMEN
-    titulo(res, f"Control de Monotributo — {empresa}", 11)
-    res["A2"], res["A2"].font = "Actualizado:", fnt(10, True)
-    res["A2"].alignment = Alignment(indent=1)
-    res["B2"], res["B2"].number_format, res["B2"].font = hoy, DATE, fnt(10, True, MID)
-    res["B2"].alignment = Alignment(horizontal="left")
-    res["D2"], res["D2"].font = "Período evaluado:", fnt(10, True)
-    res["E2"], res["E2"].font = periodo, fnt(10, True, MID)
 
+def cargar_historico():
+    """Facturación anterior al uso de los PDF. Columnas: cuit, fecha, importe.
+    La fecha puede ser un día exacto (2026-03-15, una factura) o un mes (2026-03, el total de ese mes)."""
+    df, out = leer_csv(F_HIST), []
+    for _, r in df.iterrows():
+        cuit = re.sub(r"\D", "", r.get("cuit", ""))
+        valor = (r.get("fecha") or r.get("mes") or "").strip()
+        if not cuit or not valor or not r.get("importe", "").strip():
+            continue
+        try:
+            if len(valor) <= 7:
+                fecha, tipo = pd.Period(valor, "M").end_time.date(), "Histórico (total del mes)"
+            else:
+                fecha, tipo = date.fromisoformat(valor), "Histórico (factura)"
+            importe = numero(r["importe"])
+        except ValueError:
+            print(f"[AVISO] historico.csv: fila ignorada (revisar fecha o importe): {dict(r)}")
+            continue
+        out.append({"clave": f"HIST-{cuit}-{fecha}", "fecha": fecha, "cuit": int(cuit),
+                    "comprobante": tipo, "pto_vta": 0, "numero": 0,
+                    "importe": importe, "moneda": "PES", "archivo": "historico.csv",
+                    "cargado": hoy_argentina()})
+    return pd.DataFrame(out, columns=COLUMNAS_FAC)
+
+
+# ------------------------------------------------------------------ lectura del QR
+def _decodificar_qr(gris):
+    detector = cv2.QRCodeDetector()
+    for img in (gris, cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]):
+        texto, _, _ = detector.detectAndDecode(img)
+        if texto:
+            return texto
+    return ""
+
+
+def extraer_url_qr(pdf):
+    doc = fitz.open(str(pdf))
+    for pagina in list(doc)[:2]:
+        for dpi in (150, 220, 300, 400):
+            pix = pagina.get_pixmap(dpi=dpi)
+            arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+            if pix.n == 1:
+                gris = arr[:, :, 0].copy()
+            elif pix.n == 4:
+                gris = cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
+            else:
+                gris = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            texto = _decodificar_qr(gris)
+            if texto:
+                return texto
+    raise ValueError("no se encontró ningún código QR en el PDF")
+
+
+def leer_comprobante(pdf, nombre=None):
+    url = extraer_url_qr(pdf)
+    p = parse_qs(urlparse(url).query).get("p")
+    if not p:
+        raise ValueError("el QR no es de un comprobante de ARCA")
+    b64 = p[0].replace(" ", "+").replace("-", "+").replace("_", "/")
+    d = json.loads(base64.b64decode(b64 + "=" * (-len(b64) % 4)))
+    tipo, importe = int(d["tipoCmp"]), float(d["importe"])
+    if str(d.get("moneda", "PES")).upper() != "PES":
+        importe *= float(d.get("ctz", 1))
+    if tipo in NOTAS_DE_CREDITO:
+        importe = -abs(importe)
+    return {
+        "clave": f'{int(d["cuit"])}-{int(d["ptoVta"]):05d}-{tipo}-{int(d["nroCmp"])}',
+        "fecha": date.fromisoformat(d["fecha"]), "cuit": int(d["cuit"]),
+        "comprobante": TIPOS.get(tipo, f"Tipo {tipo}"), "pto_vta": int(d["ptoVta"]),
+        "numero": int(d["nroCmp"]), "importe": round(importe, 2),
+        "moneda": str(d.get("moneda", "PES")), "archivo": nombre or pdf.name, "cargado": hoy_argentina(),
+        "receptor": d.get("receptor", ""),
+        "receptor_doc": d.get("receptorDoc", "") or d.get("receptor_doc", ""),
+        "concepto": d.get("concepto", ""),
+    }
+
+
+# ------------------------------------------------------------------ cálculos
+def calcular(trab, topes_lista, fac, umbral, hoy):
+    topes = dict(topes_lista)
+    inicio = (pd.Timestamp(hoy.year, hoy.month, 1) - pd.DateOffset(months=11)).date()
+    meses = list(pd.period_range(end=pd.Period(hoy, "M"), periods=12, freq="M"))
+    en_periodo = fac[(fac["fecha"] >= inicio) & (fac["fecha"] <= hoy)].copy()
+    en_periodo["mes"] = [pd.Period(f, "M") for f in en_periodo["fecha"]]
+    hace90 = (pd.Timestamp(hoy) - pd.Timedelta(days=90)).date()
+
+    estados, matriz = [], {}
+    for t in trab:
+        mias = en_periodo[en_periodo["cuit"] == t["cuit"]]
+        matriz[t["cuit"]] = [round(float(mias.loc[mias["mes"] == m, "importe"].sum()), 2) for m in meses]
+        total = round(float(mias["importe"].sum()), 2)
+        tope = topes.get(t["cat"])
+        uso = total / tope if tope else None
+        disp = tope - total if tope else None
+        estado = ("FALTA TOPE" if tope is None else "EXCEDIDO" if uso >= 1
+                  else "ALERTA" if uso >= umbral else "OK")
+        ritmo = round(float(mias.loc[mias["fecha"] > hace90, "importe"].sum()) / 3, 2)
+        if tope is None or ritmo <= 0:
+            meses_tope = None
+        else:
+            meses_tope = 0 if disp <= 0 else disp / ritmo
+        estados.append({"cuit": t["cuit"], "nombre": t["nombre"], "cat": t["cat"], "tope": tope,
+                        "total": total, "disp": disp, "uso": uso, "estado": estado, "ritmo": ritmo,
+                        "meses_tope": meses_tope, "ultima": mias["fecha"].max() if len(mias) else None})
+    estados.sort(key=lambda x: (-RANGO[x["estado"]], -(x["uso"] or 0)))
+    return estados, matriz, inicio, meses
+
+
+# ------------------------------------------------------------------ salidas
+def escribir_resumen_md(cfg, hoy, inicio, estados, sin_registrar, n_errores):
+    ico = {"OK": "🟢", "ALERTA": "🟡", "EXCEDIDO": "🔴", "FALTA TOPE": "⚪"}
     cuenta = lambda e: sum(1 for x in estados if x["estado"] == e)
-    kpis = [("Trabajadores registrados", n, "0", NAVY),
-            ("En regla", cuenta("OK"), "0", "548235"),
-            ("En alerta", cuenta("ALERTA"), "0", "BF8F00"),
-            ("Excedidos", cuenta("EXCEDIDO"), "0", "C00000"),
-            ("Facturado total (período)", sum(x["total"] for x in estados), MONEY, NAVY)]
-    for i, (lab, val, fmt, col) in enumerate(kpis):
-        r = 4 + i
-        res.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
-        a = res.cell(row=r, column=1, value=lab)
-        a.font, a.alignment = fnt(10, True, "FFFFFF"), Alignment(vertical="center", indent=1)
-        for c in (1, 2, 3):
-            res.cell(row=r, column=c).fill = fill(col)
-        v = res.cell(row=r, column=4, value=val)
-        v.number_format, v.font, v.fill = fmt, fnt(12, True, col), fill(GREY)
-        v.alignment = Alignment(horizontal="right", vertical="center")
-        res.row_dimensions[r].height = 22
-
-    res["F4"], res["F4"].font = "Cómo leer el estado", fnt(10, True)
-    leyenda = [("OK", f"Menos del {umbral:.0%} del tope"), ("ALERTA", f"Desde el {umbral:.0%} del tope"),
-               ("EXCEDIDO", "Superó el tope de su categoría"), ("FALTA TOPE", "Categoría sin tope cargado")]
-    for i, (e, txt) in enumerate(leyenda):
-        c = res.cell(row=5 + i, column=6, value=e)
-        c.fill, c.font = fill(ESTADOS[e][0]), fnt(9, True, ESTADOS[e][1])
-        c.alignment = Alignment(horizontal="center")
-        res.cell(row=5 + i, column=7, value=txt).font = fnt(9, color="595959")
-
-    avisos = []
+    L = [f"# Control de Monotributo — {cfg['empresa']}", "",
+         f"**Actualizado:** {hoy:%d/%m/%Y} · **Período:** {inicio:%m/%Y} a {hoy:%m/%Y}", "",
+         f"🟢 En regla: **{cuenta('OK')}** · 🟡 En alerta: **{cuenta('ALERTA')}** · "
+         f"🔴 Excedidos: **{cuenta('EXCEDIDO')}**", "",
+         "| Estado | Trabajador | Cat. | Facturado | Tope | Uso | Disponible |", "|---|---|:-:|--:|--:|--:|--:|"]
+    for x in estados:
+        uso = f"{x['uso']:.1%}" if x["uso"] is not None else "-"
+        tope = pesos(x["tope"]) if x["tope"] else "-"
+        disp = pesos(x["disp"]) if x["disp"] is not None else "-"
+        L.append(f"| {ico[x['estado']]} {x['estado']} | {x['nombre']} | {x['cat']} | "
+                 f"{pesos(x['total'])} | {tope} | {uso} | {disp} |")
     if sin_registrar:
-        avisos.append("⚠ Facturas de CUIT que no están en trabajadores.csv: "
-                      + ", ".join(str(c) for c in sorted(sin_registrar)))
+        L += ["", "⚠️ CUIT con facturas que no están en `datos/trabajadores.csv`: "
+              + ", ".join(cuit_fmt(c) for c in sorted(sin_registrar))]
     if n_errores:
-        avisos.append(f"⚠ {n_errores} PDF no se pudieron leer en la última ejecución (quedaron en con_error): cargalos a mano")
-    for i, t in enumerate(avisos):
-        c = res.cell(row=9 + i, column=1, value=t)
-        c.font = fnt(10, True, "9C0006")
+        L += ["", f"⚠️ {n_errores} PDF no se pudieron leer en la última ejecución (quedaron en `con_error`)."]
+    L += ["", "_Detalle y gráficos en `Control_Monotributo_SERVELEC.xlsx`._"]
+    RESUMEN_MD.write_text("\n".join(L) + "\n", encoding="utf-8")
 
-    encabezado(res, 11, ["CUIT", "Trabajador", "Categoría", "Tope anual", "Facturado en el período",
-                         "Disponible", "Uso del tope", "Estado", "Ritmo mensual (últ. 90 días)",
-                         "Meses hasta el tope", "Última factura"])
-    for i, x in enumerate(estados):
-        r = 12 + i
-        vals = [x["cuit"], seguro(x["nombre"]), x["cat"], x["tope"] if x["tope"] else "-", x["total"],
-                x["disp"] if x["disp"] is not None else "-", x["uso"] if x["uso"] is not None else "-",
-                x["estado"], x["ritmo"],
-                "-" if x["meses_tope"] is None else ("Superado" if x["meses_tope"] == 0 else x["meses_tope"]),
-                x["ultima"] if x["ultima"] else "-"]
-        fmts = [CUIT, "@", "@", MONEY, MONEY, MONEY, "0.0%", "@", MONEY, '0.0 "meses"', DATE]
-        for j, (v, fm) in enumerate(zip(vals, fmts), start=1):
-            c = res.cell(row=r, column=j, value=v)
-            c.number_format, c.font, c.border = fm, fnt(10), box
-            if j in (1, 3, 7, 8, 10, 11):
-                c.alignment = Alignment(horizontal="center")
-            if i % 2 == 1 and j != 8:
-                c.fill = fill(GREY)
-        bg, fg = ESTADOS[x["estado"]]
-        e = res.cell(row=r, column=8)
-        e.fill, e.font = fill(bg), fnt(10, True, fg)
-    if n:
-        res.conditional_formatting.add(f"G12:G{11 + n}", DataBarRule(
-            start_type="num", start_value=0, end_type="num", end_value=1, color="8FAADC", showValue=True))
-        r = 12 + n
-        res.cell(row=r, column=2, value="TOTAL").font = fnt(10, True)
-        t = res.cell(row=r, column=5, value=round(sum(x["total"] for x in estados), 2))
-        t.number_format, t.font = MONEY, fnt(10, True)
-        for c in range(1, 12):
-            res.cell(row=r, column=c).border = Border(top=Side(style="medium", color=NAVY))
-    nota = res.cell(row=14 + n, column=1,
-                    value="Ritmo = facturado en los últimos 90 días ÷ 3. Meses hasta el tope = disponible ÷ ritmo "
-                          "(estimación lineal, orientativa).")
-    nota.font = fnt(9, italic=True, color="595959")
-    anchos(res, [17, 30, 11, 19, 21, 19, 13, 13, 22, 17, 14])
-    res.freeze_panes = "A12"
-    res.page_setup.orientation = "landscape"
-    res.page_setup.fitToWidth, res.page_setup.fitToHeight = 1, 0
-    res.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # ============================================================ MENSUAL
-    titulo(men, "Facturación mensual por trabajador", 14,
-           f"Período {periodo}. Las notas de crédito restan. Importes en pesos.")
-    etiquetas = [etiqueta_mes(p) for p in meses]
-    encabezado(men, 4, ["Trabajador"] + etiquetas + ["Total"])
-    for i, x in enumerate(estados):
-        r = 5 + i
-        men.cell(row=r, column=1, value=seguro(x["nombre"])).font = fnt(10)
-        for j, v in enumerate(matriz[x["cuit"]]):
-            c = men.cell(row=r, column=2 + j, value=v)
-            c.number_format, c.font = MONEY0, fnt(9)
-        t = men.cell(row=r, column=14, value=round(sum(matriz[x["cuit"]]), 2))
-        t.number_format, t.font = MONEY0, fnt(10, True)
-        for c in range(1, 15):
-            men.cell(row=r, column=c).border = box
-    rt = 5 + n
-    men.cell(row=rt, column=1, value="TOTAL").font = fnt(10, True)
-    tot_mes = [round(sum(matriz[x["cuit"]][j] for x in estados), 2) for j in range(12)]
-    for j, v in enumerate(tot_mes + [round(sum(tot_mes), 2)], start=2):
-        c = men.cell(row=rt, column=j, value=v)
-        c.number_format, c.font = MONEY0, fnt(10, True)
-        c.border = Border(top=Side(style="medium", color=NAVY))
-    if n:
-        men.conditional_formatting.add(f"B5:M{rt - 1}", ColorScaleRule(
-            start_type="min", start_color="FFFFFF", end_type="max", end_color="8FAADC"))
-    anchos(men, [28] + [13] * 12 + [15])
-    men.freeze_panes = "B5"
+def mostrar(estados):
+    print("\n" + "=" * 78)
+    print(f"{'Trabajador':<28}{'Cat':<5}{'Facturado':>20}{'Uso':>8}  Estado")
+    print("-" * 78)
+    for x in estados:
+        uso = f"{x['uso']:.1%}" if x["uso"] is not None else "-"
+        print(f"{x['nombre'][:27]:<28}{x['cat']:<5}{pesos(x['total']):>20}{uso:>8}  {x['estado']}")
+    print("=" * 78)
 
-    # ============================================================ GRÁFICOS
-    titulo(gra, "Gráficos", 20, "Se actualizan solos en cada ejecución.")
-    if n:
-        cats = Reference(res, min_col=2, min_row=12, max_row=11 + n)
-        # 1) uso del tope
-        c1 = BarChart()
-        c1.type = "bar"
-        c1.add_data(Reference(res, min_col=7, min_row=11, max_row=11 + n), titles_from_data=True)
-        c1.set_categories(cats)
-        c1.x_axis.scaling.orientation = "maxMin"
-        c1.y_axis.scaling.min = 0
-        pintar(c1.series[0], MID)
-        estilo_grafico(c1, "Uso del tope por trabajador")
-        c1.legend = None
-        gra.add_chart(c1, "A4")
-        # 2) facturado vs tope
-        c2 = BarChart()
-        c2.type = "col"
-        c2.add_data(Reference(res, min_col=5, min_row=11, max_row=11 + n), titles_from_data=True)
-        c2.add_data(Reference(res, min_col=4, min_row=11, max_row=11 + n), titles_from_data=True)
-        c2.set_categories(cats)
-        pintar(c2.series[0], MID)
-        pintar(c2.series[1], "C00000")
-        estilo_grafico(c2, "Facturado en el período vs. tope anual")
-        gra.add_chart(c2, "L4")
-        # 3) total por mes
-        c3 = BarChart()
-        c3.type = "col"
-        c3.add_data(Reference(men, min_col=2, max_col=13, min_row=rt), from_rows=True, titles_from_data=False)
-        c3.set_categories(Reference(men, min_col=2, max_col=13, min_row=4))
-        pintar(c3.series[0], NAVY)
-        estilo_grafico(c3, "Facturación total por mes")
-        c3.legend = None
-        gra.add_chart(c3, "A23")
-        # 4) apilado por trabajador
-        c4 = BarChart()
-        c4.type = "col"
-        c4.grouping, c4.overlap = "stacked", 100
-        c4.add_data(Reference(men, min_col=1, max_col=13, min_row=5, max_row=4 + n),
-                    from_rows=True, titles_from_data=True)
-        c4.set_categories(Reference(men, min_col=2, max_col=13, min_row=4))
-        estilo_grafico(c4, "Facturación mensual por trabajador")
-        gra.add_chart(c4, "L23")
-    anchos(gra, [9] * 20)
 
-    # ============================================================ FICHA (gráfico individual)
-    titulo(fic, "Ficha por trabajador", 8, "Elegí un trabajador en la celda amarilla.")
-    fic["A3"], fic["A3"].font = "Trabajador:", fnt(11, True)
-    fic["B3"] = estados[0]["nombre"] if n else ""
-    fic["B3"].font, fic["B3"].fill, fic["B3"].border = fnt(11, True, "0000FF"), fill("FFF9E5"), box
-    fic.merge_cells("B3:D3")
-    if n:
-        dv = DataValidation(type="list", formula1=f"=Resumen!$B$12:$B${11 + n}", allow_blank=False)
-        fic.add_data_validation(dv)
-        dv.add("B3")
-        idx = f"MATCH($B$3,Resumen!$B$12:$B${11 + n},0)"
-        campos = [("CUIT", "A", CUIT), ("Categoría", "C", "@"), ("Tope anual", "D", MONEY),
-                  ("Facturado", "E", MONEY), ("Disponible", "F", MONEY), ("Uso del tope", "G", "0.0%"),
-                  ("Estado", "H", "@"), ("Ritmo mensual", "I", MONEY)]
-        for i, (lab, col, fm) in enumerate(campos):
-            r = 5 + i // 2
-            c0 = 1 + (i % 2) * 4
-            fic.cell(row=r, column=c0, value=lab).font = fnt(10, True, "595959")
-            v = fic.cell(row=r, column=c0 + 1, value=f"=INDEX(Resumen!${col}$12:${col}${11 + n},{idx})")
-            v.number_format, v.font = fm, fnt(11, True, NAVY)
-            v.alignment = Alignment(horizontal="left")
-        encabezado(fic, 11, ["Mes", "Facturado en el mes", "Acumulado", "Tope anual"])
-        for j in range(12):
-            r = 12 + j
-            L = men.cell(row=1, column=2 + j).column_letter
-            fic.cell(row=r, column=1, value=etiquetas[j]).font = fnt(10)
-            b = fic.cell(row=r, column=2, value=f"=INDEX(Mensual!{L}$5:{L}${4 + n},MATCH($B$3,Mensual!$A$5:$A${4 + n},0))")
-            ac = fic.cell(row=r, column=3, value=f"=SUM($B$12:B{r})")
-            tp = fic.cell(row=r, column=4, value="=IF(ISNUMBER($B$6),$B$6,NA())")
-            for c in (b, ac, tp):
-                c.number_format, c.font = MONEY0, fnt(10)
-        for c in range(1, 5):
-            for r in range(12, 24):
-                fic.cell(row=r, column=c).border = box
-        bar = BarChart()
-        bar.type = "col"
-        bar.add_data(Reference(fic, min_col=2, min_row=11, max_row=23), titles_from_data=True)
-        bar.set_categories(Reference(fic, min_col=1, min_row=12, max_row=23))
-        pintar(bar.series[0], "8FAADC")
-        lin = LineChart()
-        lin.add_data(Reference(fic, min_col=3, max_col=4, min_row=11, max_row=23), titles_from_data=True)
-        lin.series[0].graphicalProperties.line.solidFill = NAVY
-        lin.series[0].graphicalProperties.line.width = 28000
-        lin.series[1].graphicalProperties.line.solidFill = "C00000"
-        lin.series[1].graphicalProperties.line.dashStyle = "dash"
-        lin.series[1].graphicalProperties.line.width = 22000
-        estilo_grafico(bar, "Acumulado del período vs. tope", 19, 9.5)
-        bar += lin
-        fic.add_chart(bar, "F11")
-    anchos(fic, [14, 24, 16, 16, 14, 18, 3, 3])
-    fic.column_dimensions["G"].width = 3
+def enviar_avisos(cfg, estados):
+    m = cfg["mail"]
+    if str(m.get("activar", "no")).strip().lower() not in ("si", "sí", "yes", "true", "1"):
+        return
+    usuario = os.environ.get("SMTP_USUARIO") or m.get("usuario", "")
+    clave = os.environ.get("SMTP_CLAVE") or m.get("clave", "")
+    destinos = os.environ.get("SMTP_DESTINATARIOS") or m.get("destinatarios", "")
+    if not (usuario and clave and destinos):
+        log("Avisos por mail activados pero faltan usuario, clave o destinatarios.")
+        return
+    previo = json.loads(ESTADO.read_text(encoding="utf-8")) if ESTADO.exists() else {}
+    nuevos = [x for x in estados if RANGO[x["estado"]] > RANGO.get(previo.get(str(x["cuit"]), "OK"), 0)]
+    if nuevos:
+        cuerpo = ["Cambios detectados en el control de monotributo:\n"]
+        for x in nuevos:
+            cuerpo.append(f"- {x['nombre']} ({cuit_fmt(x['cuit'])}), categoría {x['cat']}: {x['estado']} - "
+                          f"{pesos(x['total'])} de {pesos(x['tope'])} ({x['uso']:.1%})")
+        msg = EmailMessage()
+        msg["Subject"] = f"Monotributo: {len(nuevos)} trabajador(es) en alerta o excedidos"
+        msg["From"], msg["To"] = usuario, destinos
+        msg.set_content("\n".join(cuerpo))
+        try:
+            with smtplib.SMTP(m.get("servidor", "smtp.gmail.com"), int(m.get("puerto", "587"))) as s:
+                s.starttls()
+                s.login(usuario, clave)
+                s.send_message(msg)
+            log(f"Mail de aviso enviado ({len(nuevos)} trabajador/es).")
+        except Exception as e:
+            log(f"No se pudo enviar el mail: {e}")
+            return
+    # el estado guardado baja si mejora (así vuelve a avisar si empeora de nuevo)
+    ESTADO.write_text(json.dumps({str(x["cuit"]): x["estado"] for x in estados}), encoding="utf-8")
 
-    # ============================================================ FACTURAS
-    titulo(fac, "Registro de facturas", 14, "Se completa solo al leer los PDF. Fuente: datos/facturas.csv e historico.csv")
-    encabezado(fac, 4, ["Fecha", "CUIT emisor", "Trabajador", "Comprobante", "Pto. Vta.", "Número", "Receptor",
-                        "CUIT/DNI receptor", "Concepto", "Importe (ARS)", "Moneda orig.", "Origen", "Cargado el",
-                        "Computa"])
-    for i, f in enumerate(facturas):
-        r = 5 + i
-        vals = [f["fecha"], f["cuit"], seguro(f["trabajador"]), f["tipo"], f["pto_vta"], f["numero"],
-                seguro(f["receptor"]), f["receptor_doc"], seguro(f["concepto"]), f["importe"], f["moneda"],
-                seguro(f["archivo"]), f["cargado"], "Sí" if f["computa"] else "No (fuera del período)"]
-        fmts = [DATE, CUIT, "@", "@", "00000", "00000000", "@", "@", "@", MONEY, "@", "@", DATE, "@"]
-        for j, (v, fm) in enumerate(zip(vals, fmts), start=1):
-            c = fac.cell(row=r, column=j, value=v)
-            c.number_format, c.border = fm, box
-            c.font = fnt(10, color="808080") if (j >= 11 or not f["computa"]) else fnt(10)
-            if i % 2 == 1:
-                c.fill = fill(GREY)
-        if f["trabajador"] == "No registrado":
-            fac.cell(row=r, column=3).fill = fill("FFC7CE")
-            fac.cell(row=r, column=3).font = fnt(10, True, "9C0006")
-    fac.auto_filter.ref = f"A4:N{4 + max(len(facturas), 1)}"
-    fac.freeze_panes = "A5"
-    anchos(fac, [12, 16, 26, 22, 9, 12, 32, 17, 30, 18, 11, 18, 12, 22])
 
-    # ============================================================ TOPES
-    titulo(top, "Topes anuales por categoría", 2, vigencia_topes)
-    encabezado(top, 4, ["Categoría", "Tope anual (ingresos brutos)"])
-    for i, (cat, v) in enumerate(topes):
-        a = top.cell(row=5 + i, column=1, value=cat)
-        a.font, a.alignment, a.border = fnt(10, True), Alignment(horizontal="center"), box
-        b = top.cell(row=5 + i, column=2, value=v)
-        b.number_format, b.font, b.border = MONEY, fnt(10), box
-    top.cell(row=6 + len(topes), column=1, value="Se editan en datos/topes.csv").font = fnt(9, italic=True, color="595959")
-    anchos(top, [14, 34])
+# ------------------------------------------------------------------ de dónde salen los PDF
+@dataclass
+class Item:
+    id: str
+    nombre: str
+    ruta: Path
 
-    for ws, col in [(res, NAVY), (gra, MID), (fic, MID), (men, "BF8F00"), (fac, "BF8F00"), (top, "7F7F7F")]:
-        ws.sheet_properties.tabColor = col
-    wb.calculation.fullCalcOnLoad = True
-    wb.save(ruta)
+
+def mover(archivo, carpeta):
+    destino = carpeta / archivo.name
+    if destino.exists():
+        destino = carpeta / f"{archivo.stem}_{datetime.now():%H%M%S}{archivo.suffix}"
+    shutil.move(str(archivo), str(destino))
+
+
+class OrigenLocal:
+    """PDF subidos a la carpeta 'facturas' del repositorio (alternativa a Drive)."""
+    nombre = "carpeta facturas del repositorio"
+
+    def pendientes(self):
+        ENTRADA.mkdir(exist_ok=True)
+        return [Item(str(p), p.name, p) for p in sorted(ENTRADA.iterdir()) if p.suffix.lower() == ".pdf"]
+
+    def terminar(self, item, resultado):
+        destino = ERRORES if resultado == "error" else PROCESADAS
+        destino.mkdir(exist_ok=True)
+        mover(item.ruta, destino)
+
+
+class OrigenDrive:
+    """PDF guardados en una carpeta de Google Drive compartida con la cuenta de servicio."""
+    nombre = "Google Drive"
+
+    def __init__(self, servicio, carpeta_id, tmp):
+        self.s, self.carpeta, self.tmp = servicio, carpeta_id, Path(tmp)
+        self.hechos = json.loads(F_DRIVE.read_text(encoding="utf-8")) if F_DRIVE.exists() else {}
+        self.sub = {n: self._buscar_subcarpeta(n) for n in ("procesadas", "con_error")}
+
+    @classmethod
+    def desde_entorno(cls, tmp):
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"])
+        servicio = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return cls(servicio, os.environ["DRIVE_FOLDER_ID"].strip(), tmp)
+
+    def _listar(self, q):
+        out, token = [], None
+        while True:
+            r = self.s.files().list(q=q, fields="nextPageToken, files(id, name)", pageSize=100,
+                                    pageToken=token, supportsAllDrives=True,
+                                    includeItemsFromAllDrives=True).execute()
+            out += r.get("files", [])
+            token = r.get("nextPageToken")
+            if not token:
+                return out
+
+    def _buscar_subcarpeta(self, nombre):
+        q = (f"'{self.carpeta}' in parents and trashed=false and name='{nombre}' "
+             "and mimeType='application/vnd.google-apps.folder'")
+        r = self._listar(q)
+        return r[0]["id"] if r else None
+
+    def _descargar(self, file_id):
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, self.s.files().get_media(fileId=file_id, supportsAllDrives=True))
+        listo = False
+        while not listo:
+            _, listo = dl.next_chunk()
+        return buf.getvalue()
+
+    def _mover(self, file_id, destino):
+        self.s.files().update(fileId=file_id, addParents=destino, removeParents=self.carpeta,
+                              supportsAllDrives=True, fields="id").execute()
+
+    def pendientes(self):
+        q = f"'{self.carpeta}' in parents and trashed=false and mimeType='application/pdf'"
+        items = []
+        for f in self._listar(q):
+            if f["id"] in self.hechos:
+                continue
+            ruta = self.tmp / f"{f['id']}.pdf"
+            ruta.write_bytes(self._descargar(f["id"]))
+            items.append(Item(f["id"], f["name"], ruta))
+        return items
+
+    def terminar(self, item, resultado):
+        # Se anota siempre qué PDF ya se vio (así no se relee aunque no se pueda mover en Drive)
+        self.hechos[item.id] = {"nombre": item.nombre, "resultado": resultado,
+                                "fecha": hoy_argentina().isoformat()}
+        F_DRIVE.write_text(json.dumps(self.hechos, indent=1, ensure_ascii=False), encoding="utf-8")
+        destino = self.sub["con_error" if resultado == "error" else "procesadas"]
+        if destino:
+            try:
+                self._mover(item.id, destino)
+            except Exception as e:
+                log(f"[AVISO] No pude mover '{item.nombre}' dentro de Drive: {e}")
+
+
+# ------------------------------------------------------------------ principal
+def main():
+    DATOS.mkdir(exist_ok=True)
+    cfg, hoy = leer_config(), hoy_argentina()
+    trab, topes, fac = cargar_trabajadores(), cargar_topes(), cargar_facturas()
+    hist = cargar_historico()
+    hasta = hist.groupby("cuit")["fecha"].max().to_dict() if not hist.empty else {}
+    if not topes:
+        sys.exit("Falta datos/topes.csv (o está vacío).")
+
+    tmp = tempfile.TemporaryDirectory()
+    origenes, hubo_fallo = [OrigenLocal()], False
+    if os.environ.get("GOOGLE_CREDENTIALS") and os.environ.get("DRIVE_FOLDER_ID"):
+        try:
+            origenes.append(OrigenDrive.desde_entorno(tmp.name))
+        except Exception as e:
+            log(f"[ERROR] No pude conectarme a Google Drive: {e}")
+            hubo_fallo = True
+    pendientes = []
+    for o in origenes:
+        try:
+            pendientes += [(o, it) for it in o.pendientes()]
+        except Exception as e:
+            log(f"[ERROR] No pude leer los PDF de {o.nombre}: {e}")
+            hubo_fallo = True
+
+    claves = set(fac["clave"])
+    agregadas, resultados = [], []
+    for o, it in pendientes:
+        try:
+            c = leer_comprobante(it.ruta, it.nombre)
+        except Exception as e:
+            log(f"[ERROR] {it.nombre}: {e}")
+            resultados.append((o, it, "error"))
+            continue
+        if c["fecha"] <= hasta.get(c["cuit"], date.min):
+            log(f"[AVISO] {it.nombre}: es del {c['fecha']:%d/%m/%Y}, un mes que ya está en el histórico: no se suma.")
+            resultados.append((o, it, "duplicado"))
+        elif c["clave"] in claves:
+            resultados.append((o, it, "duplicado"))
+        else:
+            claves.add(c["clave"])
+            agregadas.append(c)
+            resultados.append((o, it, "ok"))
+    if agregadas:
+        fac = pd.concat([fac, pd.DataFrame(agregadas)[COLUMNAS_FAC]], ignore_index=True)
+        fac.sort_values(["fecha", "cuit", "numero"]).to_csv(F_FAC, index=False, encoding="utf-8")
+    for o, it, r in resultados:
+        o.terminar(it, r)
+    if pendientes:
+        cuenta = lambda r: sum(1 for x in resultados if x[2] == r)
+        log(f"PDF encontrados: {len(pendientes)} | cargados: {cuenta('ok')} | "
+            f"duplicados: {cuenta('duplicado')} | con error: {cuenta('error')}")
+        for c in agregadas:
+            log(f"  + {cuit_fmt(c['cuit'])}  {c['comprobante']} {c['pto_vta']:05d}-{c['numero']:08d}  "
+                f"{pesos(c['importe'])}")
+    else:
+        print("No hay PDF nuevos.")
+    errores_pend = sum(1 for x in resultados if x[2] == "error")
+
+    fac = pd.concat([fac, hist], ignore_index=True) if not hist.empty else fac
+    estados, matriz, inicio, meses = calcular(trab, topes, fac, cfg["umbral"], hoy)
+    nombres = {t["cuit"]: t["nombre"] for t in trab}
+    sin_registrar = set(fac["cuit"]) - set(nombres)
+    registro = []
+    for _, f in fac.sort_values(["fecha", "numero"], ascending=False).iterrows():
+        registro.append({"fecha": f["fecha"], "cuit": int(f["cuit"]),
+                         "trabajador": nombres.get(int(f["cuit"]), "No registrado"),
+                         "tipo": f["comprobante"], "pto_vta": int(f["pto_vta"]) or None, "numero": int(f["numero"]) or None,
+                         "receptor": str(f.get("receptor", "") or ""),
+                         "receptor_doc": str(f.get("receptor_doc", "") or ""),
+                         "concepto": str(f.get("concepto", "") or ""),
+                         "importe": f["importe"], "moneda": f["moneda"], "archivo": f["archivo"],
+                         "cargado": f["cargado"], "computa": inicio <= f["fecha"] <= hoy})
+    try:
+        planilla.construir(EXCEL, cfg["empresa"], cfg["umbral"], hoy, inicio, meses, estados, matriz,
+                           registro, topes, cfg["vigencia"], sin_registrar, errores_pend)
+    except PermissionError:
+        sys.exit("El Excel está abierto. Cerralo y volvé a ejecutar.")
+    escribir_resumen_md(cfg, hoy, inicio, estados, sin_registrar, errores_pend)
+    for cuit in sin_registrar:
+        print(f"[AVISO] El CUIT {cuit_fmt(cuit)} tiene facturas pero no está en trabajadores.csv")
+    mostrar(estados)
+    enviar_avisos(cfg, estados)
+    if hubo_fallo:
+        sys.exit("Hubo errores al leer los PDF (ver arriba): el control se generó con los datos disponibles.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
