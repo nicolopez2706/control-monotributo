@@ -301,6 +301,93 @@ def datos_del_texto(pdf):
     except Exception:
         return "", ""
 
+def _texto_con_espacios(pagina, rect):
+    """Texto de un recuadro del PDF, reconstruyendo los espacios por la distancia entre letras.
+    (Algunos PDF no traen caracteres de espacio y las palabras salen pegadas.)"""
+    renglones = []
+    for b in pagina.get_text("rawdict", clip=rect).get("blocks", []):
+        for l in b.get("lines", []):
+            partes, fin = [], None
+            for s in l.get("spans", []):
+                tam = s.get("size", 10) or 10
+                for ch in s.get("chars", []):
+                    x0, x1 = ch["bbox"][0], ch["bbox"][2]
+                    if fin is not None and ch["c"] != " " and (x0 - fin) > 0.15 * tam:
+                        partes.append(" ")
+                    partes.append(ch["c"])
+                    fin = x1
+            renglones.append("".join(partes))
+    return " ".join(" ".join(renglones).split())
+
+
+def _arreglar_espacios(pagina, texto):
+    """Si el texto salió pegado (sin espacios), lo vuelve a leer del PDF reconstruyendo los espacios."""
+    if not texto:
+        return texto
+    palabras = texto.split()
+    if not (len(palabras) == 1 and len(texto) >= 12) and not any(len(w) > 20 for w in palabras):
+        return texto
+    try:
+        for r in pagina.search_for(texto)[:1]:
+            nuevo = _texto_con_espacios(pagina, (r.x0 - 1, r.y0 - 1, r.x1 + 1, r.y1 + 1))
+            if nuevo:
+                return nuevo
+    except Exception:
+        pass
+    return texto
+
+
+def _valor_tras_etiqueta(lineas, patron):
+    for i, l in enumerate(lineas):
+        if re.search(patron, l, re.I):
+            resto = l.split(":", 1)[1].strip() if ":" in l else ""
+            if resto:
+                return " ".join(resto.split())
+            for sig in lineas[i + 1:i + 4]:
+                if not sig.endswith(":") and not re.match(r"(condici|domicilio|cuit|ingresos|fecha)", sig, re.I):
+                    return " ".join(sig.split())
+    return ""
+
+
+def _concepto(pagina, lineas):
+    """Primer renglón del detalle de la factura (por ejemplo 'Honorarios')."""
+    palabras = ("producto", "servicio", "descrip")
+    try:  # 1) tabla del detalle
+        for t in pagina.find_tables().tables:
+            filas = t.extract()
+            for k, fila in enumerate(filas):
+                celdas = [(c or "").strip().lower() for c in fila]
+                cols = [j for j, c in enumerate(celdas) if any(p in c for p in palabras)]
+                if cols:
+                    for f2 in filas[k + 1:]:
+                        v = (f2[cols[0]] or "").strip() if cols[0] < len(f2) else ""
+                        if v:
+                            return " ".join(v.split())
+    except Exception:
+        pass
+    ruido = re.compile(r"^(c[oó]digo|producto\s*/\s*servicio|cantidad|u\.?\s*medida|precio\s*unit\.?|"
+                       r"%\s*bonif\.?|imp\.?\s*bonif\.?|subtotal|unidades?|otras unidades|horas?)$", re.I)
+    for i, l in enumerate(lineas):  # 2) por el texto
+        if re.search(r"producto\s*/\s*servicio", l, re.I):
+            for sig in lineas[i + 1:i + 15]:
+                if re.match(r"(subtotal|importe|total)\s*:", sig, re.I):
+                    break
+                if re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]{3,}", sig) and not ruido.match(sig.strip(": ")):
+                    return " ".join(sig.split())
+    return ""
+
+
+def datos_del_texto(pdf):
+    """Lee del texto del PDF el nombre del receptor y el concepto. Si no se puede, devuelve vacío."""
+    try:
+        pagina = fitz.open(str(pdf))[0]
+        lineas = [l.strip() for l in pagina.get_text("text").splitlines() if l.strip()]
+        receptor = _valor_tras_etiqueta(lineas, r"apellido y nombre\s*/\s*raz[oó]n social")
+        concepto = _concepto(pagina, lineas)
+        return _arreglar_espacios(pagina, receptor), _arreglar_espacios(pagina, concepto)
+    except Exception:
+        return "", ""
+
 
 def leer_comprobante(pdf, nombre=None, mapa=None):
     url = extraer_url_qr(pdf)
