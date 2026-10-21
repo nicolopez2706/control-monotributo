@@ -1,1 +1,2 @@
-clave,fecha,cuit,comprobante,pto_vta,numero,importe,moneda,archivo,cargado
+clave,fecha,cuit,comprobante,pto_vta,numero,importe,moneda,archivo,cargado,receptor_doc,receptor,concepto
+
