@@ -1,6 +1,6 @@
 # Control de Monotributo — SERVELEC
 
-**Actualizado:** 20/10/2026 · **Período:** 11/2025 a 10/2026
+**Actualizado:** 21/10/2026 · **Período:** 01/2026 a 12/2026
 
 🟢 En regla: **5** · 🟡 En alerta: **0** · 🔴 Excedidos: **1**
 
