@@ -28,6 +28,11 @@ def fill(c):
     return PatternFill("solid", fgColor=c)
 
 
+def seguro(v):
+    """Un texto que empiece con '=' se interpretaría como fórmula: se le antepone un espacio."""
+    return " " + v if isinstance(v, str) and v.startswith("=") else v
+
+
 def etiqueta_mes(p):
     return f"{MESES[p.month - 1]}-{str(p.year)[2:]}"
 
@@ -90,7 +95,6 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
     men = wb.create_sheet("Mensual")
     fac = wb.create_sheet("Facturas")
     top = wb.create_sheet("Topes")
-    ins = wb.create_sheet("Instrucciones")
     for ws in wb.worksheets:
         ws.sheet_view.showGridLines = False
     n = len(estados)
@@ -147,7 +151,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
                          "Meses hasta el tope", "Última factura"])
     for i, x in enumerate(estados):
         r = 12 + i
-        vals = [x["cuit"], x["nombre"], x["cat"], x["tope"] if x["tope"] else "-", x["total"],
+        vals = [x["cuit"], seguro(x["nombre"]), x["cat"], x["tope"] if x["tope"] else "-", x["total"],
                 x["disp"] if x["disp"] is not None else "-", x["uso"] if x["uso"] is not None else "-",
                 x["estado"], x["ritmo"],
                 "-" if x["meses_tope"] is None else ("Superado" if x["meses_tope"] == 0 else x["meses_tope"]),
@@ -174,7 +178,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
             res.cell(row=r, column=c).border = Border(top=Side(style="medium", color=NAVY))
     nota = res.cell(row=14 + n, column=1,
                     value="Ritmo = facturado en los últimos 90 días ÷ 3. Meses hasta el tope = disponible ÷ ritmo "
-                          "(estimación lineal, orientativa). El período incluye el mes en curso.")
+                          "(estimación lineal, orientativa).")
     nota.font = fnt(9, italic=True, color="595959")
     anchos(res, [17, 30, 11, 19, 21, 19, 13, 13, 22, 17, 14])
     res.freeze_panes = "A12"
@@ -189,7 +193,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
     encabezado(men, 4, ["Trabajador"] + etiquetas + ["Total"])
     for i, x in enumerate(estados):
         r = 5 + i
-        men.cell(row=r, column=1, value=x["nombre"]).font = fnt(10)
+        men.cell(row=r, column=1, value=seguro(x["nombre"])).font = fnt(10)
         for j, v in enumerate(matriz[x["cuit"]]):
             c = men.cell(row=r, column=2 + j, value=v)
             c.number_format, c.font = MONEY0, fnt(9)
@@ -207,19 +211,6 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
     if n:
         men.conditional_formatting.add(f"B5:M{rt - 1}", ColorScaleRule(
             start_type="min", start_color="FFFFFF", end_type="max", end_color="8FAADC"))
-    # bloque auxiliar para el gráfico apilado: principales 8 + "Otros"
-    orden = sorted(estados, key=lambda x: -x["total"])
-    top8, resto = orden[:8], orden[8:]
-    aux0 = rt + 3
-    men.cell(row=aux0 - 1, column=1, value="Datos del gráfico (principales 8 + otros)").font = fnt(9, True, "595959")
-    filas_aux = [(x["nombre"], matriz[x["cuit"]]) for x in top8]
-    if resto:
-        filas_aux.append(("Otros", [sum(matriz[x["cuit"]][j] for x in resto) for j in range(12)]))
-    for i, (nom, vals) in enumerate(filas_aux):
-        men.cell(row=aux0 + i, column=1, value=nom).font = fnt(9, color="595959")
-        for j, v in enumerate(vals):
-            c = men.cell(row=aux0 + i, column=2 + j, value=v)
-            c.number_format, c.font = MONEY0, fnt(9, color="595959")
     anchos(men, [28] + [13] * 12 + [15])
     men.freeze_panes = "B5"
 
@@ -261,7 +252,7 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         c4 = BarChart()
         c4.type = "col"
         c4.grouping, c4.overlap = "stacked", 100
-        c4.add_data(Reference(men, min_col=1, max_col=13, min_row=aux0, max_row=aux0 + len(filas_aux) - 1),
+        c4.add_data(Reference(men, min_col=1, max_col=13, min_row=5, max_row=4 + n),
                     from_rows=True, titles_from_data=True)
         c4.set_categories(Reference(men, min_col=2, max_col=13, min_row=4))
         estilo_grafico(c4, "Facturación mensual por trabajador")
@@ -321,26 +312,28 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
     fic.column_dimensions["G"].width = 3
 
     # ============================================================ FACTURAS
-    titulo(fac, "Registro de facturas", 11, "Se completa solo al leer los PDF. Fuente: datos/facturas.csv")
-    encabezado(fac, 4, ["Fecha", "CUIT emisor", "Trabajador", "Comprobante", "Pto. Vta.", "Número",
-                        "Importe (ARS)", "Moneda orig.", "Archivo", "Cargado el", "Computa"])
+    titulo(fac, "Registro de facturas", 14, "Se completa solo al leer los PDF. Fuente: datos/facturas.csv e historico.csv")
+    encabezado(fac, 4, ["Fecha", "CUIT emisor", "Trabajador", "Comprobante", "Pto. Vta.", "Número", "Receptor",
+                        "CUIT/DNI receptor", "Concepto", "Importe (ARS)", "Moneda orig.", "Origen", "Cargado el",
+                        "Computa"])
     for i, f in enumerate(facturas):
         r = 5 + i
-        vals = [f["fecha"], f["cuit"], f["trabajador"], f["tipo"], f["pto_vta"], f["numero"], f["importe"],
-                f["moneda"], f["archivo"], f["cargado"], "Sí" if f["computa"] else "No (fuera del período)"]
-        fmts = [DATE, CUIT, "@", "@", "00000", "00000000", MONEY, "@", "@", DATE, "@"]
+        vals = [f["fecha"], f["cuit"], seguro(f["trabajador"]), f["tipo"], f["pto_vta"], f["numero"],
+                seguro(f["receptor"]), f["receptor_doc"], seguro(f["concepto"]), f["importe"], f["moneda"],
+                seguro(f["archivo"]), f["cargado"], "Sí" if f["computa"] else "No (fuera del período)"]
+        fmts = [DATE, CUIT, "@", "@", "00000", "00000000", "@", "@", "@", MONEY, "@", "@", DATE, "@"]
         for j, (v, fm) in enumerate(zip(vals, fmts), start=1):
             c = fac.cell(row=r, column=j, value=v)
             c.number_format, c.border = fm, box
-            c.font = fnt(10, color="808080") if (j >= 9 or not f["computa"]) else fnt(10)
+            c.font = fnt(10, color="808080") if (j >= 11 or not f["computa"]) else fnt(10)
             if i % 2 == 1:
                 c.fill = fill(GREY)
         if f["trabajador"] == "No registrado":
             fac.cell(row=r, column=3).fill = fill("FFC7CE")
-            f.cell(row=r, column=3).font = fnt(10, True, "9C0006")
-    fac.auto_filter.ref = f"A4:K{4 + max(len(facturas), 1)}"
+            fac.cell(row=r, column=3).font = fnt(10, True, "9C0006")
+    fac.auto_filter.ref = f"A4:N{4 + max(len(facturas), 1)}"
     fac.freeze_panes = "A5"
-    anchos(fac, [12, 16, 28, 26, 9, 12, 18, 11, 26, 12, 22])
+    anchos(fac, [12, 16, 26, 22, 9, 12, 32, 17, 30, 18, 11, 18, 12, 22])
 
     # ============================================================ TOPES
     titulo(top, "Topes anuales por categoría", 2, vigencia_topes)
@@ -350,33 +343,10 @@ def construir(ruta, empresa, umbral, hoy, inicio, meses, estados, matriz, factur
         a.font, a.alignment, a.border = fnt(10, True), Alignment(horizontal="center"), box
         b = top.cell(row=5 + i, column=2, value=v)
         b.number_format, b.font, b.border = MONEY, fnt(10), box
-    ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
-                     "Si falta cargar alguna, su total real puede ser mayor."),
+    top.cell(row=6 + len(topes), column=1, value="Se editan en datos/topes.csv").font = fnt(9, italic=True, color="595959")
+    anchos(top, [14, 34])
 
-    # ============================================================ INSTRUCCIONES
-    titulo(ins, "Cómo se usa esta planilla", 2)
-    lineas = [
-        ("Qué es", "Un informe que se genera solo: no se edita a mano (los cambios se pisan en la próxima ejecución)."),
-        ("Dónde se cargan los datos", "En el repositorio: datos/trabajadores.csv, datos/topes.csv y config.ini."),
-        ("Facturas", "Subí los PDF a la carpeta facturas del repositorio; el script lee el QR y las agrega."),
-        ("Resumen", "Estado de cada trabajador: facturado en el período vs. tope, disponible y ritmo."),
-        ("Gráficos / Ficha", "Gráficos generales y un gráfico individual (elegí el trabajador en la hoja Ficha)."),
-        ("Mensual", "Cuánto facturó cada uno mes a mes (mapa de calor)."),
-        ("Período", "Los 12 meses calendario que terminan en el mes actual (incluido). ARCA usa meses cerrados: "
-                    "este criterio es algo más conservador."),
-        ("Qué suma", "Todas las facturas cargadas de cada trabajador, sin importar a qué cliente se emitieron. "
-                     "Si falta cargar alguna, su total real puede ser mayor."),
-        ("Aviso", "Herramienta de control interno. No reemplaza el asesoramiento de un contador."),
-    ]
-    for i, (k, v) in enumerate(lineas):
-        a = ins.cell(row=3 + i, column=1, value=k)
-        a.font, a.alignment = fnt(10, True, MID), Alignment(vertical="top", indent=1)
-        b = ins.cell(row=3 + i, column=2, value=v)
-        b.font, b.alignment = fnt(10), Alignment(wrap_text=True, vertical="top")
-        ins.row_dimensions[3 + i].height = 32
-    anchos(ins, [28, 100])
-
-    for ws, col in [(res, NAVY), (gra, MID), (fic, MID), (men, "BF8F00"), (fac, "BF8F00"), (top, "7F7F7F"), (ins, "7F7F7F")]:
+    for ws, col in [(res, NAVY), (gra, MID), (fic, MID), (men, "BF8F00"), (fac, "BF8F00"), (top, "7F7F7F")]:
         ws.sheet_properties.tabColor = col
     wb.calculation.fullCalcOnLoad = True
     wb.save(ruta)
